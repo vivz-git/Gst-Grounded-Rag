@@ -286,42 +286,100 @@ def detect_boundary(
     return None
 
 
+# Words that, when appearing at the END of a line, indicate the line is a wrapped
+# prose sentence rather than a self-contained heading.
+_CONTINUATION_TAIL_WORDS: set = {
+    "the", "a", "an", "and", "or", "of", "in", "to", "for", "on", "at",
+    "by", "as", "is", "are", "was", "were", "be", "been", "that", "which",
+    "with", "from", "into", "under", "over", "sub-", "only", "not", "no",
+    "its", "their", "his", "her", "this", "these", "those", "any", "all",
+    "each", "both", "than", "when", "where", "whether", "how", "may",
+    "shall", "can", "will", "has", "have", "had", "also", "even", "only",
+    "such", "same", "other", "another", "so", "if", "else", "but",
+}
+
+
 def _is_conservative_section_heading(line: str) -> bool:
     """
-    Conservatively evaluate whether a line represents a section/topic heading.
+    Conservatively evaluate whether a line represents a genuine section/topic heading
+    in a GST/CBIC circular, as opposed to a wrapped continuation sentence.
 
-    Criteria:
-      - Length between 8 and 120 characters.
-      - Starts with an uppercase ASCII letter.
-      - Does not end with terminal sentence punctuation ('.', '?', '!', ';').
-      - Does not start with common prose words, boilerplate, provisos, or statutory citations.
-      - Contains at least 2 alphabetic words.
+    Corpus-informed rules (from real document analysis):
+      1. Length between 8 and 120 characters.
+      2. Must start with an uppercase ASCII letter.
+      3. Must NOT end with terminal sentence punctuation ('.' '?' '!' ';').
+      4. Must NOT end with a hyphen (line-wrapped mid-word or mid-year like '2018-').
+      5. Must NOT end with a trailing comma (prose continuation marker).
+      6. Must NOT end with a continuation/function word (the, and, of, in, a, etc.)
+         — these indicate the sentence wrapped to the next line.
+      7. Must NOT start with any prose/boilerplate/statutory prefix.
+      8. Must NOT start with a lowercase letter.
+      9. Must NOT contain mid-line sentence punctuation followed by a new clause
+         (period + space + uppercase = two-sentence prose, not a heading).
+      10. Must contain at least 3 alphabetic words.
+      11. Must NOT match known boilerplate identifier patterns
+          (e.g. 'Principal Commissioner', 'Sanjay Mangal', bare months, bare years).
+      12. Must NOT contain a slash that suggests an address or option ('(All)', 'he/she').
     """
     if len(line) < 8 or len(line) > 120:
         return False
 
-    # Must start with an uppercase letter
-    if not line[0].isupper():
+    stripped = line.strip()
+    if not stripped:
         return False
 
-    # Must not end with terminal sentence punctuation
-    if line.endswith((".", "?", "!", ";")):
+    # Rule 2: Must start with an uppercase ASCII letter
+    if not stripped[0].isupper():
         return False
 
-    line_lower = line.lower()
+    # Rule 3: Must not end with terminal sentence punctuation
+    if stripped.endswith((".", "?", "!", ";")):
+        return False
 
-    # Reject common prose starters, boilerplate, statutory phrases
+    # Rule 4: Must not end with a hyphen (wrapped mid-word like 'sub-' or mid-year '2018-')
+    if stripped.endswith("-"):
+        return False
+
+    # Rule 5: Must not end with a trailing comma (prose continuation)
+    if stripped.endswith(","):
+        return False
+
+    # Rule 6: Must not end with a continuation/function word
+    last_word = stripped.rstrip(".,;:)-").rsplit(None, 1)[-1].lower().rstrip(")-,.") if stripped.rsplit(None, 1) else ""
+    if last_word in _CONTINUATION_TAIL_WORDS:
+        return False
+
+    line_lower = stripped.lower()
+
+    # Rule 7: Reject common prose starters, boilerplate, statutory phrases
     for prefix in PROSE_HEADING_EXCLUSIONS:
         if line_lower.startswith(prefix):
             return False
 
-    # Reject if it contains full sentence clause separators like " which " or " that " followed by verbs
-    words = [w for w in re.split(r"\s+", line) if any(c.isalpha() for c in w)]
-    if len(words) < 2:
+    # Rule 9: Must not contain mid-line sentence punctuation ('. ' followed by uppercase = 2+ sentences)
+    if re.search(r"\. [A-Z]", stripped):
+        return False
+
+    # Rule 10: Require at least 3 alphabetic words
+    words = [w for w in re.split(r"\s+", stripped) if any(c.isalpha() for c in w)]
+    if len(words) < 3:
         return False
 
     # Reject lines containing email addresses or URLs
-    if "@" in line or "http://" in line or "https://" in line or "www." in line:
+    if "@" in stripped or "http://" in stripped or "https://" in stripped or "www." in stripped:
+        return False
+
+    # Rule 11: Reject single-name or title-only lines, including with parenthetical qualifiers.
+    # Patterns: 'Sanjay Mangal', 'Principal Commissioner (GST)', 'Director General (DRI)'
+    if re.match(r"^[A-Z][a-z]+ [A-Z][a-z]+(\s*\([^)]*\))?\s*$", stripped):
+        return False
+    # Month name at start indicates a date/sentence fragment
+    month_pat = r"^(January|February|March|April|May|June|July|August|September|October|November|December)"
+    if re.match(month_pat, stripped):
+        return False
+
+    # Rule 12: Lines containing '(All)' or slash-based options are addressee fragments
+    if "(All)" in stripped or "/" in stripped:
         return False
 
     return True
@@ -471,6 +529,10 @@ class ChunkerState:
     chunk_page_end: int = 1
     sequence_number: int = 1
     in_enumeration: bool = False
+    trailing_hyphen_active: bool = False
+    # Set to True when the last substantive line of the previous page ended with a
+    # trailing hyphen, indicating a mid-word or mid-token split across a page break
+    # (e.g. '2018-' on page N → '19. ...' on page N+1 should NOT be treated as Para 19).
 
 
 def _flush_current_chunk(
@@ -628,9 +690,45 @@ def chunk_page(
     # --------------------------------------------------------------------------
     lines = page.text.splitlines()
 
+    # Bug Fix 2: Identify if the first substantive line on this page should be
+    # treated as a continuation because the previous page ended with a trailing hyphen.
+    # If so, join the first substantive line as continuation text, skip boundary detection
+    # on it, and clear the flag.
+    first_substantive_consumed = False
+
     for line in lines:
         stripped = line.strip()
         if not stripped:
+            continue
+
+        # Bug Fix 2: If the previous page ended with a trailing hyphen (e.g. "2018-")
+        # then this first substantive line is a cross-page continuation, NOT a new
+        # structural boundary — even if it looks like "19. Further...".
+        if current_state.trailing_hyphen_active and not first_substantive_consumed:
+            first_substantive_consumed = True
+            current_state.trailing_hyphen_active = False
+            # Treat as pure continuation regardless of boundary detector result
+            if not current_state.current_section_path:
+                current_state.current_section_path = "preamble" if page.page_number == 1 else "1"
+                current_state.current_chunk_type = "preamble" if page.page_number == 1 else "paragraph"
+                current_state.chunk_page_start = page.page_number
+            current_state.chunk_page_end = page.page_number
+            current_state.current_lines.append(line)
+            continue
+
+        first_substantive_consumed = True
+
+        # Bug Fix 2 (intra-page): If the last line already added to the buffer
+        # ends with a trailing hyphen, the current line continues that token/word
+        # and must NOT be treated as a new boundary — even if it starts with "19."
+        prev_line_in_buffer = current_state.current_lines[-1].strip() if current_state.current_lines else ""
+        if prev_line_in_buffer.endswith("-"):
+            if not current_state.current_section_path:
+                current_state.current_section_path = "preamble" if page.page_number == 1 else "1"
+                current_state.current_chunk_type = "preamble" if page.page_number == 1 else "paragraph"
+                current_state.chunk_page_start = page.page_number
+            current_state.chunk_page_end = page.page_number
+            current_state.current_lines.append(line)
             continue
 
         boundary = detect_boundary(line, in_enumeration=current_state.in_enumeration)
@@ -676,6 +774,17 @@ def chunk_page(
 
             current_state.chunk_page_end = page.page_number
             current_state.current_lines.append(line)
+
+    # Bug Fix 2: Before leaving this page, check if the last substantive line ends
+    # with a hyphen. If so, arm the flag so the next page's first line is treated as
+    # continuation regardless of its structural appearance.
+    last_substantive = ""
+    for l in reversed(lines):
+        if l.strip():
+            last_substantive = l.strip()
+            break
+    if last_substantive.endswith("-"):
+        current_state.trailing_hyphen_active = True
 
     if flush_at_end:
         flushed = _flush_current_chunk(current_state, doc_meta)
