@@ -793,3 +793,199 @@ def chunk_page(
 
     return chunks
 
+
+# ==============================================================================
+# 6. Small-Fragment Merging
+# ==============================================================================
+
+def _extract_substantive_text(text: str) -> str:
+    """
+    Extract body text excluding the first line context header if present.
+    """
+    lines = text.split("\n", 1)
+    if len(lines) > 1 and lines[0].startswith("[") and " | " in lines[0] and lines[0].endswith("]"):
+        return lines[1].strip()
+    return text.strip()
+
+
+def _are_chunks_compatible(c1: Chunk, c2: Chunk) -> bool:
+    """
+    Determine if two chunks are structurally compatible to be merged.
+
+    Rules:
+      - Table chunks cannot merge with any chunk.
+      - Chunks must belong to the same document.
+      - Same section path (e.g. both '4.1' or both 'preamble') -> compatible.
+      - Both preamble/header -> compatible.
+      - Parent-child hierarchy (e.g. '4.1' and '4.1.(a)', or '3' and '3.1') -> compatible.
+      - Sibling sub-sections under the same non-empty parent (e.g. '4.1.(a)' and '4.1.(b)') -> compatible.
+      - Unrelated top-level paragraphs (e.g. '5' and '6') -> NOT compatible.
+    """
+    # Table chunks cannot be merged with other chunks
+    if c1.chunk_type.startswith("table") or c2.chunk_type.startswith("table"):
+        return False
+
+    # Must be from the same document
+    if c1.doc_id != c2.doc_id:
+        return False
+
+    # Same section path (e.g. both '4.1' or both 'preamble')
+    if c1.section_path and c1.section_path == c2.section_path:
+        return True
+
+    # Preamble / header compatibility
+    if c1.chunk_type in ("preamble", "header") and c2.chunk_type in ("preamble", "header"):
+        return True
+
+    # Parent-child relationship
+    if c1.parent_section and c1.parent_section == c2.section_path:
+        return True
+    if c2.parent_section and c2.parent_section == c1.section_path:
+        return True
+
+    # Sibling clauses under same non-empty parent (e.g. '4.1.(a)' and '4.1.(b)')
+    if c1.parent_section and c2.parent_section and c1.parent_section == c2.parent_section:
+        return True
+
+    # Prefix hierarchy (e.g. '3' and '3.1', or '4.1' and '4.1.2')
+    if c1.section_path and c2.section_path:
+        if c2.section_path.startswith(f"{c1.section_path}."):
+            return True
+        if c1.section_path.startswith(f"{c2.section_path}."):
+            return True
+
+    return False
+
+
+def _merge_two_chunks(target: Chunk, frag: Chunk, frag_is_before: bool) -> Chunk:
+    """
+    Merge `frag` chunk into `target` chunk, preserving `target`'s metadata.
+    If `frag_is_before` is True, frag's body text is prepended before target's body text.
+    Otherwise, frag's body text is appended after target's body text.
+    """
+    target_body = _extract_substantive_text(target.text)
+    frag_body = _extract_substantive_text(frag.text)
+
+    if frag_is_before:
+        merged_body = f"{frag_body}\n{target_body}" if frag_body else target_body
+    else:
+        merged_body = f"{target_body}\n{frag_body}" if target_body else frag_body
+
+    context_header = f"[{target.circular_number} | {target.section_path} | {target.section_title}]"
+    full_text = f"{context_header}\n{merged_body}" if merged_body else context_header
+    token_count = len(full_text.split())
+
+    page_start = min(target.page_start, frag.page_start)
+    page_end = max(target.page_end, frag.page_end)
+
+    return Chunk(
+        chunk_id=target.chunk_id,
+        doc_id=target.doc_id,
+        source_filename=target.source_filename,
+        page_start=page_start,
+        page_end=page_end,
+        section_path=target.section_path,
+        parent_section=target.parent_section,
+        section_title=target.section_title,
+        text=full_text,
+        token_count=token_count,
+        chunk_type=target.chunk_type,
+        parsing_method=target.parsing_method,
+        circular_number=target.circular_number,
+        date_issued=target.date_issued,
+        metadata=dict(target.metadata),
+    )
+
+
+def _can_merge(target: Chunk, frag: Chunk, frag_is_before: bool) -> bool:
+    """
+    Check if `frag` can be safely merged into `target` without violating
+    compatibility or MAX_CHUNK_TOKENS constraint.
+    """
+    if not _are_chunks_compatible(target, frag):
+        return False
+    merged = _merge_two_chunks(target, frag, frag_is_before)
+    return merged.token_count <= MAX_CHUNK_TOKENS
+
+
+def merge_small_fragments(chunks: List[Chunk]) -> List[Chunk]:
+    """
+    Post-processing pass to merge small chunk fragments (< MIN_CHUNK_TOKENS)
+    into adjacent compatible chunks.
+
+    Rules:
+      1. Prefer merging upward into immediately preceding compatible chunk.
+      2. If no preceding compatible chunk exists, merge downward into immediately
+         following compatible chunk.
+      3. Recompute token_count, page_start, and page_end.
+      4. Never merge across incompatible boundaries (e.g. table chunks, unrelated sections).
+      5. Never exceed MAX_CHUNK_TOKENS.
+      6. If no safe merge is possible, retain the fragment rather than corrupting structure.
+      7. Deterministically re-index chunk_ids at the end of the pass.
+
+    Args:
+        chunks: List of Chunk objects to post-process.
+
+    Returns:
+        New list of Chunk objects with small fragments merged where compatible.
+    """
+    if not chunks:
+        return []
+
+    # Pass 1: Upward merge pass (prefer merging into preceding compatible chunk)
+    merged_list: List[Chunk] = []
+    for c in chunks:
+        if not merged_list:
+            merged_list.append(c)
+            continue
+
+        prev = merged_list[-1]
+        if c.token_count < MIN_CHUNK_TOKENS and _can_merge(prev, c, frag_is_before=False):
+            merged_list[-1] = _merge_two_chunks(prev, c, frag_is_before=False)
+        else:
+            merged_list.append(c)
+
+    # Pass 2: Downward merge pass for any remaining small chunks
+    # (e.g. first chunk was small and had no preceding chunk, or upward merge was incompatible)
+    final_list: List[Chunk] = []
+    i = 0
+    while i < len(merged_list):
+        curr = merged_list[i]
+        if curr.token_count < MIN_CHUNK_TOKENS and (i + 1) < len(merged_list):
+            next_chunk = merged_list[i + 1]
+            if _can_merge(next_chunk, curr, frag_is_before=True):
+                # Merge curr downward into next_chunk
+                merged_next = _merge_two_chunks(next_chunk, curr, frag_is_before=True)
+                merged_list[i + 1] = merged_next
+                i += 1
+                continue
+        final_list.append(curr)
+        i += 1
+
+    # Pass 3: Re-generate deterministic chunk IDs with clean 1-based sequential numbering
+    result: List[Chunk] = []
+    for seq, c in enumerate(final_list, start=1):
+        clean_path = re.sub(r"[^a-zA-Z0-9_.]", "_", c.section_path)
+        new_id = f"{c.doc_id}__{clean_path}__{seq:04d}"
+        c_updated = Chunk(
+            chunk_id=new_id,
+            doc_id=c.doc_id,
+            source_filename=c.source_filename,
+            page_start=c.page_start,
+            page_end=c.page_end,
+            section_path=c.section_path,
+            parent_section=c.parent_section,
+            section_title=c.section_title,
+            text=c.text,
+            token_count=c.token_count,
+            chunk_type=c.chunk_type,
+            parsing_method=c.parsing_method,
+            circular_number=c.circular_number,
+            date_issued=c.date_issued,
+            metadata=dict(c.metadata),
+        )
+        result.append(c_updated)
+
+    return result
+
+
