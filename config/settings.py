@@ -76,7 +76,7 @@ EMBEDDING_DIM: int = 384
 RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # LLM generation model via Google Generative AI API
-LLM_MODEL: str = "gemini-1.5-flash"
+LLM_MODEL: str = "gemini-2.5-flash"
 
 
 # ==============================================================================
