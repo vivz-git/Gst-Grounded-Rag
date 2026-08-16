@@ -97,8 +97,15 @@ MIN_CHUNK_TOKENS: int = 30
 # Number of candidate chunks retrieved by keyword search (BM25)
 BM25_TOP_K: int = 20
 
-# Number of candidate chunks retrieved by dense vector search (Qdrant)
+# Number of candidate chunks retrieved by dense vector search
 DENSE_TOP_K: int = 20
+
+# Weights for simple linear hybrid fusion
+BM25_WEIGHT: float = 0.5
+DENSE_WEIGHT: float = 0.5
+
+# Number of final top chunks returned by hybrid retriever
+HYBRID_TOP_K: int = 20
 
 # Smoothing constant for Reciprocal Rank Fusion (RRF): score = 1 / (RRF_K + rank)
 RRF_K: int = 60
