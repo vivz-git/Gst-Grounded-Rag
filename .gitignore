@@ -7,3 +7,5 @@ venv/
 .env
 
 data/pdfs/
+indexes/
+*.pkl
