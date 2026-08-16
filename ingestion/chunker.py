@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import MAX_CHUNK_TOKENS, MIN_CHUNK_TOKENS
+from ingestion.pdf_parser import PageText
 
 
 # ==============================================================================
@@ -450,3 +451,236 @@ def get_parent_section(section_path: str) -> str:
     if "." in section_path:
         return section_path.rpartition(".")[0]
     return ""
+
+
+# ==============================================================================
+# 5. Chunker State & Page-Level Processing
+# ==============================================================================
+
+@dataclass
+class ChunkerState:
+    """
+    Maintains active hierarchical context, metadata, and line buffers across lines
+    and page boundaries during document chunking.
+    """
+    current_section_path: str = ""
+    current_section_title: str = ""
+    current_chunk_type: str = "paragraph"
+    current_lines: List[str] = field(default_factory=list)
+    chunk_page_start: int = 1
+    chunk_page_end: int = 1
+    sequence_number: int = 1
+    in_enumeration: bool = False
+
+
+def _flush_current_chunk(
+    state: ChunkerState,
+    doc_meta: Dict[str, Any],
+) -> Optional[Chunk]:
+    """
+    Construct a Chunk from the current buffer in ChunkerState and reset the buffer.
+    Returns None if the buffer is empty or contains only an isolated marker line.
+    """
+    if not state.current_lines:
+        return None
+
+    raw_body = "\n".join(state.current_lines).strip()
+    if not raw_body:
+        state.current_lines = []
+        return None
+
+    # Check if raw_body is only an isolated marker line (e.g. "1." or "4.1" or "(a)")
+    words = [w for w in re.split(r"\s+", raw_body) if any(c.isalnum() for c in w)]
+    if len(words) == 0:
+        state.current_lines = []
+        return None
+
+    if len(words) == 1 and (
+        words[0].rstrip(".").isdigit()
+        or _is_roman_token(words[0])
+        or _is_clause_token(words[0])
+    ):
+        state.current_lines = []
+        return None
+
+    doc_id = doc_meta.get("doc_id", "doc")
+    source_filename = doc_meta.get("source_filename", f"{doc_id}.pdf")
+    circular_number = doc_meta.get("circular_number", "")
+    date_issued = doc_meta.get("date_issued", "")
+
+    section_path = state.current_section_path or "1"
+    parent_section = get_parent_section(section_path)
+    section_title = state.current_section_title or ""
+
+    # Context header format: [{circular_number} | {section_path} | {section_title}]
+    context_header = f"[{circular_number} | {section_path} | {section_title}]"
+    full_text = f"{context_header}\n{raw_body}"
+    token_count = len(full_text.split())
+
+    # Deterministic chunk_id: format "{doc_id}_{clean_section_path}_{seq:04d}"
+    clean_path = re.sub(r"[^a-zA-Z0-9_.]", "_", section_path)
+    chunk_id = f"{doc_id}__{clean_path}__{state.sequence_number:04d}"
+    state.sequence_number += 1
+
+    chunk = Chunk(
+        chunk_id=chunk_id,
+        doc_id=doc_id,
+        source_filename=source_filename,
+        page_start=state.chunk_page_start,
+        page_end=state.chunk_page_end,
+        section_path=section_path,
+        parent_section=parent_section,
+        section_title=section_title,
+        text=full_text,
+        token_count=token_count,
+        chunk_type=state.current_chunk_type,
+        parsing_method="structural",
+        circular_number=circular_number,
+        date_issued=date_issued,
+    )
+
+    state.current_lines = []
+    return chunk
+
+
+def flush_chunker_state(
+    state: ChunkerState,
+    doc_meta: Dict[str, Any],
+) -> Optional[Chunk]:
+    """
+    Public function to flush any remaining pending chunk buffer in ChunkerState.
+    """
+    return _flush_current_chunk(state, doc_meta)
+
+
+def chunk_page(
+    page: PageText,
+    doc_meta: Dict[str, Any],
+    current_state: ChunkerState,
+    flush_at_end: bool = False,
+) -> List[Chunk]:
+    """
+    Process a single PageText line-by-line and assemble structural chunks.
+
+    Args:
+        page: The PageText object containing page number, cleaned text, and table flag.
+        doc_meta: Document metadata dictionary (doc_id, source_filename, circular_number, date_issued).
+        current_state: Mutable ChunkerState tracking hierarchy and buffer across pages.
+        flush_at_end: If True, flushes any remaining line buffer at the end of this page.
+
+    Returns:
+        List of completed Chunk objects produced on this page.
+    """
+    chunks: List[Chunk] = []
+
+    # --------------------------------------------------------------------------
+    # 1. Table Handling: Atomic Single-Chunk Emission
+    # --------------------------------------------------------------------------
+    if page.has_table:
+        # Flush any existing buffer before table
+        pre_chunk = _flush_current_chunk(current_state, doc_meta)
+        if pre_chunk:
+            chunks.append(pre_chunk)
+
+        doc_id = doc_meta.get("doc_id", "doc")
+        source_filename = doc_meta.get("source_filename", f"{doc_id}.pdf")
+        circular_number = doc_meta.get("circular_number", "")
+        date_issued = doc_meta.get("date_issued", "")
+
+        # Check for strong Q&A indicators
+        text_lower = page.text.lower()
+        is_qa = "whether" in text_lower or text_lower.startswith("q") or " if " in text_lower
+        chunk_type = "table_qa" if is_qa else "table_raw"
+
+        section_path = current_state.current_section_path or f"p.{page.page_number}"
+        parent_section = get_parent_section(section_path)
+        section_title = current_state.current_section_title or ""
+
+        context_header = f"[{circular_number} | {section_path} | {section_title}]"
+        full_text = f"{context_header}\n{page.text}"
+        token_count = len(full_text.split())
+
+        clean_path = re.sub(r"[^a-zA-Z0-9_.]", "_", section_path)
+        chunk_id = f"{doc_id}__{clean_path}__{current_state.sequence_number:04d}"
+        current_state.sequence_number += 1
+
+        table_chunk = Chunk(
+            chunk_id=chunk_id,
+            doc_id=doc_id,
+            source_filename=source_filename,
+            page_start=page.page_number,
+            page_end=page.page_number,
+            section_path=section_path,
+            parent_section=parent_section,
+            section_title=section_title,
+            text=full_text,
+            token_count=token_count,
+            chunk_type=chunk_type,
+            parsing_method="structural",
+            circular_number=circular_number,
+            date_issued=date_issued,
+        )
+        chunks.append(table_chunk)
+        return chunks
+
+    # --------------------------------------------------------------------------
+    # 2. Regular Text Processing Line-by-Line
+    # --------------------------------------------------------------------------
+    lines = page.text.splitlines()
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        boundary = detect_boundary(line, in_enumeration=current_state.in_enumeration)
+
+        if boundary is not None:
+            b_type, b_marker = boundary
+
+            if b_type == "heading":
+                # Heading line: flush active chunk, update title
+                flushed = _flush_current_chunk(current_state, doc_meta)
+                if flushed:
+                    chunks.append(flushed)
+                current_state.current_section_title = b_marker
+                continue
+
+            # Structural marker (top_level, decimal, clause, roman, bullet)
+            flushed = _flush_current_chunk(current_state, doc_meta)
+            if flushed:
+                chunks.append(flushed)
+
+            current_state.in_enumeration = (b_type in ("clause", "roman", "bullet"))
+            new_path = build_section_path(current_state.current_section_path, b_type, b_marker)
+            current_state.current_section_path = new_path
+            current_state.chunk_page_start = page.page_number
+            current_state.chunk_page_end = page.page_number
+
+            type_map = {
+                "top_level": "paragraph",
+                "decimal": "subparagraph",
+                "clause": "clause",
+                "roman": "roman_item",
+                "bullet": "bullet",
+            }
+            current_state.current_chunk_type = type_map.get(b_type, "paragraph")
+            current_state.current_lines.append(line)
+
+        else:
+            # Continuation line (proviso, ordinary prose, table fragment, etc.)
+            if not current_state.current_section_path:
+                current_state.current_section_path = "preamble" if page.page_number == 1 else "1"
+                current_state.current_chunk_type = "preamble" if page.page_number == 1 else "paragraph"
+                current_state.chunk_page_start = page.page_number
+
+            current_state.chunk_page_end = page.page_number
+            current_state.current_lines.append(line)
+
+    if flush_at_end:
+        flushed = _flush_current_chunk(current_state, doc_meta)
+        if flushed:
+            chunks.append(flushed)
+
+    return chunks
+
