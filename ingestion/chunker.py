@@ -8,12 +8,15 @@ circular document hierarchy.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import MAX_CHUNK_TOKENS, MIN_CHUNK_TOKENS
-from ingestion.pdf_parser import PageText
+from ingestion.pdf_parser import PageText, ParsedDocument
+
+logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
@@ -987,5 +990,345 @@ def merge_small_fragments(chunks: List[Chunk]) -> List[Chunk]:
         result.append(c_updated)
 
     return result
+
+
+# ==============================================================================
+# 7. Oversized Chunk Splitting
+# ==============================================================================
+
+def _split_into_structural_blocks(text: str) -> List[str]:
+    """
+    Split substantive body text into coherent structural blocks:
+      - Lettered clauses: (a), (b), (c)
+      - Roman items: (i), (ii), (iii), i., ii.
+      - Dash/bullet items: -, –, —, •, *
+
+    Returns a list of coherent structural text blocks. If no structural markers
+    are found, returns [text].
+    """
+    lines = text.splitlines()
+    if not lines:
+        return []
+
+    blocks: List[List[str]] = []
+    current_block: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current_block:
+                current_block.append(line)
+            continue
+
+        # Check if line starts a structural marker
+        is_marker = (
+            bool(re.match(r"^\s*\([a-z]\)\s+", line))
+            or bool(re.match(r"^\s*\((?:i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii)\)\s+", line, re.IGNORECASE))
+            or bool(re.match(r"^\s*(?:i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii)\.\s+", line, re.IGNORECASE))
+            or bool(re.match(r"^\s*[-–—•*]\s+", line))
+        )
+
+        if is_marker and current_block:
+            blocks.append(current_block)
+            current_block = [line]
+        else:
+            current_block.append(line)
+
+    if current_block:
+        blocks.append(current_block)
+
+    return ["\n".join(b).strip() for b in blocks if "\n".join(b).strip()]
+
+
+def _split_into_legal_sentences(text: str) -> List[str]:
+    """
+    Split text into legal sentences while strictly preserving:
+      - Proviso clauses ("Provided that...", "Provided further that...")
+      - Statutory citations ("Section 17(5)", "Rule 36(4)", "FORM GSTR-3B")
+      - Abbreviations ("e.g.", "i.e.", "etc.", "w.e.f.", "No.", "Rs.")
+      - Number/year/date formats ("2018-19", "12.03.2021", "5 lakh")
+    """
+    if not text.strip():
+        return []
+
+    # Protected abbreviations that end with a dot but do NOT terminate a sentence
+    abbrev_pattern = (
+        r"(?i)\b("
+        r"sec|section|sub-sec|sub-section|rule|sub-rule|clause|sub-clause|"
+        r"no|f\.no|f\. no|circ|circular|notif|notification|"
+        r"rs|dr|mr|mrs|ms|ca|cma|adv|"
+        r"e\.g|i\.e|viz|etc|al|w\.e\.f|r\.w|u/s|dt|dtd|dated|"
+        r"form|gstr|gstin|udin"
+        r")\.$"
+    )
+
+    # Protect decimal numbers before dot (e.g. "3.2", "12.03.2021", "5.0")
+    decimal_pattern = r"\d+\.$"
+
+    # Find potential sentence boundaries: dot, question mark, exclamation followed by space/newline
+    raw_splits = re.split(r"(?<=[.?!])\s+(?=[A-Z\"'(])", text)
+    if len(raw_splits) <= 1:
+        return [text.strip()]
+
+    sentences: List[str] = []
+    current_sentence = ""
+
+    for part in raw_splits:
+        part_str = part.strip()
+        if not part_str:
+            continue
+
+        if not current_sentence:
+            current_sentence = part_str
+            continue
+
+        # Check if the boundary between current_sentence and part_str was a false positive
+        last_word_match = re.search(r"(\S+)$", current_sentence)
+        last_word = last_word_match.group(1) if last_word_match else ""
+
+        # False boundary checks
+        is_false_boundary = (
+            bool(re.search(abbrev_pattern, last_word))
+            or bool(re.search(decimal_pattern, last_word))
+            or last_word.endswith(("vs.", "v.", "fig.", "ref."))
+            or bool(re.search(r"\bFY\s+\d{4}-\d{2}\.$", current_sentence))
+            or bool(re.search(r"\b\d{1,2}\.\d{1,2}\.\d{4}\.$", current_sentence))
+            or bool(re.search(r"\bSection\s+\d+(\(\w+\))*\.$", current_sentence, re.IGNORECASE))
+        )
+
+        # Proviso protection: If current_sentence contains an incomplete proviso clause
+        if re.search(r"(?i)\bProvided\s+(?:further\s+|also\s+)?that\b", current_sentence) and not current_sentence.endswith("."):
+            is_false_boundary = True
+
+        if is_false_boundary:
+            current_sentence = f"{current_sentence} {part_str}"
+        else:
+            sentences.append(current_sentence)
+            current_sentence = part_str
+
+    if current_sentence:
+        sentences.append(current_sentence)
+
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def _split_single_oversized_chunk(chunk: Chunk) -> List[Chunk]:
+    """
+    Split a single oversized Chunk (> MAX_CHUNK_TOKENS) into smaller coherent child chunks.
+    """
+    body = _extract_substantive_text(chunk.text)
+    if not body:
+        return [chunk]
+
+    # Context header overhead calculation
+    dummy_header = f"[{chunk.circular_number} | {chunk.section_path}[1] | {chunk.section_title}]"
+    header_tokens = len(dummy_header.split())
+    max_body_tokens = max(100, MAX_CHUNK_TOKENS - header_tokens)
+
+    # Step 1: Try structural block splitting
+    structural_blocks = _split_into_structural_blocks(body)
+
+    atomic_units: List[str] = []
+    if len(structural_blocks) > 1:
+        # If any block is larger than max_body_tokens, break that block into sentences
+        for block in structural_blocks:
+            if len(block.split()) > max_body_tokens:
+                atomic_units.extend(_split_into_legal_sentences(block))
+            else:
+                atomic_units.append(block)
+    else:
+        # No structural markers, break body into legal sentences
+        atomic_units = _split_into_legal_sentences(body)
+
+    # If text could not be broken into more than 1 unit, it's unsplittable
+    if len(atomic_units) <= 1:
+        logger.warning(
+            f"Chunk {chunk.chunk_id} ({chunk.token_count} tokens) could not be safely split "
+            f"without violating legal context constraints."
+        )
+        return [chunk]
+
+    # Step 2: Pack atomic units into child groups
+    child_groups: List[List[str]] = []
+    current_group: List[str] = []
+    current_body_tokens = 0
+
+    for unit in atomic_units:
+        u_tokens = len(unit.split())
+        if not current_group:
+            current_group.append(unit)
+            current_body_tokens = u_tokens
+        elif current_body_tokens + u_tokens <= max_body_tokens:
+            current_group.append(unit)
+            current_body_tokens += u_tokens
+        else:
+            child_groups.append(current_group)
+            current_group = [unit]
+            current_body_tokens = u_tokens
+
+    if current_group:
+        child_groups.append(current_group)
+
+    # Step 3: Rebalance tail fragment if last group is tiny (< MIN_CHUNK_TOKENS)
+    if len(child_groups) >= 2:
+        last_tokens = sum(len(u.split()) for u in child_groups[-1]) + header_tokens
+        if last_tokens < MIN_CHUNK_TOKENS:
+            prev_group = child_groups[-2]
+            if len(prev_group) > 1:
+                shifted_unit = prev_group[-1]
+                shifted_tokens = len(shifted_unit.split())
+                if (last_tokens + shifted_tokens) <= MAX_CHUNK_TOKENS:
+                    prev_group.pop()
+                    child_groups[-1].insert(0, shifted_unit)
+
+    # Step 4: Construct child Chunk objects
+    child_chunks: List[Chunk] = []
+    for k, group in enumerate(child_groups, start=1):
+        child_body = "\n".join(group).strip()
+        child_section_path = f"{chunk.section_path}[{k}]"
+        child_header = f"[{chunk.circular_number} | {child_section_path} | {chunk.section_title}]"
+        child_text = f"{child_header}\n{child_body}"
+        child_tokens = len(child_text.split())
+
+        clean_path = re.sub(r"[^a-zA-Z0-9_.]", "_", child_section_path)
+        child_id = f"{chunk.doc_id}__{clean_path}__{k:04d}"
+
+        child_chunk = Chunk(
+            chunk_id=child_id,
+            doc_id=chunk.doc_id,
+            source_filename=chunk.source_filename,
+            page_start=chunk.page_start,
+            page_end=chunk.page_end,
+            section_path=child_section_path,
+            parent_section=chunk.parent_section,
+            section_title=chunk.section_title,
+            text=child_text,
+            token_count=child_tokens,
+            chunk_type=chunk.chunk_type,
+            parsing_method=chunk.parsing_method,
+            circular_number=chunk.circular_number,
+            date_issued=chunk.date_issued,
+            metadata=dict(chunk.metadata),
+        )
+        child_chunks.append(child_chunk)
+
+    return child_chunks
+
+
+def split_oversized_chunks(chunks: List[Chunk]) -> List[Chunk]:
+    """
+    Split oversized chunks (> MAX_CHUNK_TOKENS) into smaller coherent chunks
+    at structural or sentence boundaries.
+
+    Rules:
+      1. Table chunks (table_raw, table_qa) are never split (atomic v1 rule).
+      2. Chunks <= MAX_CHUNK_TOKENS are returned unchanged.
+      3. Oversized chunks are split at structural boundaries (clauses, roman numerals, bullets)
+         first, then at sentence boundaries.
+      4. Never split inside provisos, statutory citations, year/date tokens, or single sentences.
+      5. Each split child inherits context header with indexed section_path (e.g. '4[1]', '4[2]').
+      6. Token counts and metadata are deterministically recomputed.
+      7. If a chunk cannot be safely split without violating constraints, it is kept intact.
+
+    Args:
+        chunks: List of Chunk objects to evaluate.
+
+    Returns:
+        List of Chunk objects with oversized chunks split where possible.
+    """
+    if not chunks:
+        return []
+
+    result: List[Chunk] = []
+    for c in chunks:
+        # Table chunks are never split
+        if c.chunk_type.startswith("table"):
+            result.append(c)
+            continue
+
+        # Chunks within token limits are never split
+        if c.token_count <= MAX_CHUNK_TOKENS:
+            result.append(c)
+            continue
+
+        # Oversized chunk: split
+        split_pieces = _split_single_oversized_chunk(c)
+        result.extend(split_pieces)
+
+    return result
+
+
+# ==============================================================================
+# 8. Document-Level Chunking Orchestration
+# ==============================================================================
+
+def chunk_document(
+    parsed_doc: ParsedDocument,
+    doc_metadata: Dict[str, Any],
+) -> List[Chunk]:
+    """
+    Orchestrates end-to-end document chunking for a ParsedDocument.
+
+    Workflow:
+      1. Validates input ParsedDocument and doc_metadata.
+      2. Iterates through pages with a persistent ChunkerState across page boundaries.
+      3. Calls chunk_page(page, doc_metadata, state, flush_at_end=False) for each page.
+      4. Flushes any remaining open section state exactly once at the end of the document.
+      5. Applies merge_small_fragments() to combine tiny sub-threshold fragments safely.
+      6. Applies split_oversized_chunks() to ensure non-table chunks fit within MAX_CHUNK_TOKENS.
+      7. Returns the final deterministic list of Chunk objects in document order.
+
+    Args:
+        parsed_doc: The ParsedDocument produced by pdf_parser.
+        doc_metadata: Metadata dictionary containing 'doc_id', 'source_filename',
+                      'circular_number', and optional 'date_issued'.
+
+    Returns:
+        List of finalized, deterministic Chunk objects in document order.
+
+    Raises:
+        TypeError: If parsed_doc is not a ParsedDocument or doc_metadata is not a dict.
+        ValueError: If required metadata keys are missing.
+    """
+    if not isinstance(parsed_doc, ParsedDocument):
+        raise TypeError(f"Expected ParsedDocument instance, got {type(parsed_doc).__name__}")
+
+    if not isinstance(doc_metadata, dict):
+        raise TypeError(f"Expected doc_metadata to be a dict, got {type(doc_metadata).__name__}")
+
+    # Validate required metadata fields
+    required_keys = {"doc_id", "source_filename", "circular_number"}
+    missing = required_keys - set(doc_metadata.keys())
+    if missing:
+        raise ValueError(f"Missing required metadata fields in doc_metadata: {sorted(missing)}")
+
+    if not parsed_doc.pages:
+        return []
+
+    state = ChunkerState()
+    raw_chunks: List[Chunk] = []
+
+    # 1. Process pages line-by-line across page boundaries
+    for page in parsed_doc.pages:
+        page_chunks = chunk_page(page, doc_metadata, state, flush_at_end=False)
+        raw_chunks.extend(page_chunks)
+
+    # 2. Flush remaining state at the very end of the document
+    final_chunk = flush_chunker_state(state, doc_metadata)
+    if final_chunk is not None:
+        raw_chunks.append(final_chunk)
+
+    if not raw_chunks:
+        return []
+
+    # 3. Merge small fragments (< MIN_CHUNK_TOKENS) into compatible neighbors
+    merged_chunks = merge_small_fragments(raw_chunks)
+
+    # 4. Split oversized non-table chunks (> MAX_CHUNK_TOKENS)
+    final_chunks = split_oversized_chunks(merged_chunks)
+
+    return final_chunks
+
+
 
 
