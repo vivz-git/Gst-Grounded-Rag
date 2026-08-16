@@ -324,3 +324,129 @@ def _is_conservative_section_heading(line: str) -> bool:
         return False
 
     return True
+
+
+# ==============================================================================
+# 4. Hierarchical Section Path Construction & Parent Derivation
+# ==============================================================================
+
+def _strip_trailing_token(path: str) -> Tuple[str, str]:
+    """
+    Split the rightmost dot-separated segment from path.
+    Returns (remaining_path, last_token).
+    """
+    if not path:
+        return "", ""
+    if "." in path:
+        prefix, _, token = path.rpartition(".")
+        return prefix, token
+    return "", path
+
+
+def _is_roman_token(token: str) -> bool:
+    """Check if token represents a parenthesized or bare roman numeral."""
+    if not token:
+        return False
+    t = token.lower().strip()
+    return (
+        t in {f"({r})" for r in VALID_ROMAN_NUMERALS}
+        or t in {f"{r}." for r in VALID_ROMAN_NUMERALS}
+        or t in VALID_ROMAN_NUMERALS
+    )
+
+
+def _is_clause_token(token: str) -> bool:
+    """Check if token represents a single-letter clause (e.g. '(a)', '(b)')."""
+    if not token:
+        return False
+    t = token.lower().strip()
+    return bool(re.match(r"^\([a-z]\)$", t)) and not _is_roman_token(token)
+
+
+def build_section_path(
+    current_path: str,
+    boundary_type: str,
+    marker_value: str,
+) -> str:
+    """
+    Construct a deterministic hierarchical section path given the current path
+    and a detected section boundary.
+
+    Hierarchy Rules:
+      - 'top_level': Replaces the entire hierarchy with the top-level marker (e.g. '3').
+      - 'decimal': Replaces with the decimal marker (e.g. '4.1', '4.2', '4.1.2').
+      - 'clause': Strips any descendant roman/bullet and previous sibling clause,
+                  then appends the new clause marker (e.g. '4.1.(a)', '4.1.(b)').
+      - 'roman': Strips previous sibling roman numeral and appends the new roman marker.
+      - 'bullet': Preserves current section path without altering hierarchy.
+      - 'heading': Preserves current section path without altering hierarchy.
+
+    Args:
+        current_path: Active section path before this boundary (e.g. "4.1.(a).(i)").
+        boundary_type: One of 'top_level', 'decimal', 'clause', 'roman', 'bullet', 'heading'.
+        marker_value: The extracted marker string (e.g. '5', '4.2', '(a)', '(i)', '-').
+
+    Returns:
+        New deterministic section_path string.
+
+    Raises:
+        ValueError: If boundary_type is unrecognized.
+    """
+    b_type = boundary_type.lower().strip()
+
+    if b_type == "top_level":
+        return marker_value.strip()
+
+    if b_type == "decimal":
+        return marker_value.strip()
+
+    if b_type == "clause":
+        base = current_path.strip()
+        # 1. Strip trailing roman token if present (descendant reset)
+        prefix, token = _strip_trailing_token(base)
+        if _is_roman_token(token):
+            base = prefix
+        # 2. Strip trailing clause token if present (sibling replacement)
+        prefix, token = _strip_trailing_token(base)
+        if _is_clause_token(token):
+            base = prefix
+        # 3. Append clause
+        clause_str = marker_value.strip()
+        if not clause_str.startswith("("):
+            clause_str = f"({clause_str})"
+        return f"{base}.{clause_str}" if base else clause_str
+
+    if b_type == "roman":
+        base = current_path.strip()
+        # 1. Strip trailing roman token if present (sibling replacement)
+        prefix, token = _strip_trailing_token(base)
+        if _is_roman_token(token):
+            base = prefix
+        # 2. Append roman
+        roman_str = marker_value.strip()
+        return f"{base}.{roman_str}" if base else roman_str
+
+    if b_type in ("bullet", "heading"):
+        return current_path.strip()
+
+    raise ValueError(f"Unknown boundary type: {boundary_type!r}")
+
+
+def get_parent_section(section_path: str) -> str:
+    """
+    Derive the immediate parent section path from a hierarchical section_path.
+
+    Examples:
+        "4.1.(a).(i)" -> "4.1.(a)"
+        "4.1.(a)"     -> "4.1"
+        "4.1.2"       -> "4.1"
+        "4.1"         -> "4"
+        "4"           -> ""
+        "(a)"         -> ""
+        ""            -> ""
+    """
+    if not section_path:
+        return ""
+    if "." in section_path:
+        return section_path.rpartition(".")[0]
+    return ""
