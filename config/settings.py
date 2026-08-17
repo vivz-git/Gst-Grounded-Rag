@@ -29,6 +29,7 @@ DB_PATH: Path = DB_DIR / "chunks.db"
 INDEX_DIR: Path = BASE_DIR / "indexes"
 QDRANT_PATH: Path = INDEX_DIR / "qdrant_data"
 BM25_INDEX_PATH: Path = INDEX_DIR / "bm25_index.pkl"
+DENSE_INDEX_PATH: Path = INDEX_DIR / "dense_index.pkl"
 
 # Evaluation data & output directories
 EVAL_DIR: Path = BASE_DIR / "eval"
